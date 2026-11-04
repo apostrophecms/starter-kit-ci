@@ -1,0 +1,125 @@
+# Installs every starter kit that create-apostrophe offers, the way a new
+# user would, and fails if a dependency change breaks that install.
+#
+# The kits ship without lockfiles, so each run resolves dependencies fresh
+# from the registry. That's the point: a new transitive dependency with an
+# install script that isn't in the kit's `allowScripts` is blocked by npm 12
+# (which still exits 0), leaving a project that installs "fine" but doesn't
+# work. This workflow turns that into a red build and an alert.
+name: Starter kit installs
+
+on:
+  schedule:
+    # Daily, 06:17 UTC. Off the hour because scheduled runs at :00 are
+    # often delayed or dropped when GitHub is busy.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      notify:
+        description: Open/close the tracking issue and post to Slack, as a scheduled run would
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: ${{ matrix.kit }} (${{ matrix.launcher }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with KITS in
+        # apostrophecms/apostrophe packages/create-apostrophe/src/core/kits.js.
+        # The *-demo-data variants clone the same repos as *-demo, so they're
+        # left out.
+        kit:
+          - apostrophe-essentials
+          - apostrophe-demo
+          - apostrophe-astro-essentials
+          - apostrophe-astro-demo
+        # create-apostrophe always installs with npm. `pnpm` here means the
+        # user started it with `pnpm create apostrophe`, which also pins
+        # `packageManager: npm@<version>` in the new project.
+        launcher: [ npm, pnpm ]
+    env:
+      APOS_TELEMETRY: '0'
+      # The new project isn't a git checkout, so a production build can't
+      # derive a release id on its own.
+      APOS_RELEASE_ID: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install npm 12
+        run: npm install -g npm@12 && npm --version
+
+      - name: Install pnpm
+        if: matrix.launcher == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - name: Create project
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          args=(--unattended --project-name=site --kit=${{ matrix.kit }}
+                --db=sqlite --password=ci-test-password --telemetry=off)
+          if [ '${{ matrix.launcher }}' = pnpm ]; then
+            pnpm create apostrophe@latest "${args[@]}" 2>&1 | tee install.log
+          else
+            npm create -y apostrophe@latest -- "${args[@]}" 2>&1 | tee install.log
+          fi
+
+      - name: Check for blocked install scripts
+        run: >
+          node scripts/check-install.mjs "${{ runner.temp }}/site"
+          ${{ matrix.launcher == 'pnpm' && '--expect-npm-pin' || '' }}
+
+      - name: Build
+        working-directory: ${{ runner.temp }}/site
+        run: npm run build
+
+      - name: Upload installer log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-log-${{ matrix.kit }}-${{ matrix.launcher }}
+          path: ${{ runner.temp }}/install.log
+          if-no-files-found: ignore
+
+  report:
+    needs: install
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' || inputs.notify) &&
+      contains(fromJSON('["success", "failure"]'), needs.install.result)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      # To re-enable this workflow; see the last step.
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update tracking issue and Slack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ needs.install.result }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: scripts/report.sh
+
+      # GitHub turns off scheduled workflows in a public repo after 60 days
+      # with no repository activity, and this repo rarely gets commits.
+      # Re-enabling the workflow through the API resets that timer.
+      - name: Keep schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable starter-kit-installs.yml --repo "$GITHUB_REPOSITORY"
